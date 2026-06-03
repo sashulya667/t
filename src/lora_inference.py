@@ -1,0 +1,161 @@
+"""
+Local LoRA adapter inference — same role as py2many/py2cpp in the transpile stack.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ADAPTERS_DIR = PROJECT_ROOT / "trained_adapeters"
+
+_MODEL_CACHE: dict[str, Any] = {}
+
+
+def clear_model_cache() -> None:
+    """Free GPU/MPS/CPU memory before loading another adapter (7B + 1.5B + 0.5B do not fit together)."""
+    import gc
+
+    import torch
+
+    _MODEL_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def build_translation_prompt(python_source: str) -> str:
+    """Match training_data JSONL / SFT prompt format."""
+    return (
+        "### Instruction:\n"
+        "Translate this Python code to C++.\n\n"
+        "### Python:\n"
+        f"{python_source.strip()}\n\n"
+        "### C++:\n"
+    )
+
+
+def _strip_markdown_fence(text: str) -> str:
+    value = text.strip()
+    if value.startswith("```"):
+        lines = [line for line in value.splitlines() if not line.strip().startswith("```")]
+        return "\n".join(lines).strip()
+    return value
+
+
+def extract_cpp_from_model_output(raw_text: str) -> str:
+    text = raw_text.strip()
+    fence_match = re.search(r"```(?:cpp|c\+\+)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    return _strip_markdown_fence(text)
+
+
+def discover_lora_backends(adapters_dir: Path | None = None) -> dict[str, Path]:
+    root = (adapters_dir or DEFAULT_ADAPTERS_DIR).resolve()
+    if not root.is_dir():
+        return {}
+    backends: dict[str, Path] = {}
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        if not (child / "adapter_config.json").is_file():
+            continue
+        if not (child / "adapter_model.safetensors").is_file() and not (child / "adapter_model.bin").is_file():
+            continue
+        backends[f"lora_{child.name}"] = child
+    return backends
+
+
+def adapter_path_for_backend(backend: str, adapters_dir: Path | None = None) -> Path | None:
+    if not backend.startswith("lora_"):
+        return None
+    return discover_lora_backends(adapters_dir).get(backend)
+
+
+def _load_model(adapter_dir: Path) -> tuple[Any, Any]:
+    key = str(adapter_dir.resolve())
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    base_name = str(config.get("base_model_name_or_path", "")).strip()
+    if not base_name:
+        raise ValueError(f"Missing base_model_name_or_path in {adapter_dir}")
+
+    tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir), trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    use_cuda = torch.cuda.is_available()
+    use_mps = not use_cuda and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    if use_cuda and torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    elif use_cuda or use_mps:
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+
+    model_kwargs: dict[str, Any] = {"trust_remote_code": True, "dtype": dtype}
+    if use_cuda:
+        model_kwargs["device_map"] = "auto"
+
+    base = AutoModelForCausalLM.from_pretrained(base_name, **model_kwargs)
+    model = PeftModel.from_pretrained(base, str(adapter_dir))
+    if use_mps:
+        model = model.to("mps")
+    model.eval()
+
+    _MODEL_CACHE[key] = (model, tokenizer)
+    return model, tokenizer
+
+
+def generate_cpp(
+    python_source: str,
+    adapter_dir: Path,
+    *,
+    max_new_tokens: int = 2048,
+) -> tuple[str, dict[str, Any]]:
+    import torch
+
+    model, tokenizer = _load_model(adapter_dir)
+    prompt = build_translation_prompt(python_source)
+    inputs = tokenizer(prompt, return_tensors="pt")
+    if hasattr(model, "device"):
+        device = model.device
+    else:
+        device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+        )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    new_tokens = output_ids[0, inputs["input_ids"].shape[1] :]
+    raw = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    cpp_text = extract_cpp_from_model_output(raw)
+    usage = {
+        "prompt_tokens": int(inputs["input_ids"].shape[1]),
+        "completion_tokens": int(new_tokens.shape[0]),
+        "total_tokens": int(inputs["input_ids"].shape[1] + new_tokens.shape[0]),
+        "latency_ms": latency_ms,
+    }
+    return cpp_text, usage
