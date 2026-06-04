@@ -113,6 +113,7 @@ def _run_generation(
     tests_by_item: dict[str, dict[str, Any]],
     item_ids: list[str],
     max_new_tokens: int,
+    harness_style: bool = False,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     candidates_dir = out_dir / "candidates"
@@ -173,14 +174,14 @@ def _run_generation(
                         source_text,
                         hf_model_id,
                         max_new_tokens=max_new_tokens,
-                        harness_style=bool(args.harness_prompt),
+                        harness_style=harness_style,
                     )
                 else:
                     cpp_text, usage = generate_cpp(
                         source_text,
                         lora_targets[backend],
                         max_new_tokens=max_new_tokens,
-                        harness_style=bool(args.harness_prompt),
+                        harness_style=harness_style,
                     )
                 if cpp_text.strip():
                     cpp_target_dir = candidates_dir / backend / variant
@@ -316,6 +317,7 @@ def main() -> None:
                 tests_by_item=tests_by_item,
                 item_ids=item_ids,
                 max_new_tokens=max_new_tokens,
+                harness_style=bool(args.harness_prompt),
             )
             if not args.no_zip:
                 zip_paths.append(_zip_directory(sub_out))
@@ -333,6 +335,7 @@ def main() -> None:
             tests_by_item=tests_by_item,
             item_ids=item_ids,
             max_new_tokens=max_new_tokens,
+            harness_style=bool(args.harness_prompt),
         )
         if not args.no_zip:
             zip_paths.append(_zip_directory(out_dir))
