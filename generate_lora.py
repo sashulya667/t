@@ -170,11 +170,17 @@ def _run_generation(
                 if base_only:
                     hf_model_id = base_targets[backend]
                     cpp_text, usage = generate_cpp_base(
-                        source_text, hf_model_id, max_new_tokens=max_new_tokens
+                        source_text,
+                        hf_model_id,
+                        max_new_tokens=max_new_tokens,
+                        harness_style=bool(args.harness_prompt),
                     )
                 else:
                     cpp_text, usage = generate_cpp(
-                        source_text, lora_targets[backend], max_new_tokens=max_new_tokens
+                        source_text,
+                        lora_targets[backend],
+                        max_new_tokens=max_new_tokens,
+                        harness_style=bool(args.harness_prompt),
                     )
                 if cpp_text.strip():
                     cpp_target_dir = candidates_dir / backend / variant
@@ -246,6 +252,11 @@ def main() -> None:
         "--no-zip",
         action="store_true",
         help="Do not create .zip archives after generation",
+    )
+    parser.add_argument(
+        "--harness-prompt",
+        action="store_true",
+        help="Stricter prompt: function-only, std::vector for lists, no main/includes (better for eval)",
     )
     args = parser.parse_args()
 

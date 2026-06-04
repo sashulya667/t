@@ -30,8 +30,25 @@ def clear_model_cache() -> None:
         torch.mps.empty_cache()
 
 
-def build_translation_prompt(python_source: str) -> str:
-    """Match training_data JSONL / SFT prompt format."""
+def build_translation_prompt(python_source: str, *, harness_style: bool = False) -> str:
+    """Build the user prompt for C++ generation.
+
+    Default (harness_style=False): same as training_data / SFT.
+    harness_style=True: stricter rules for pipeline compile/test harness (use for base vs LoRA eval).
+    """
+    if harness_style:
+        return (
+            "### Instruction:\n"
+            "Translate this Python code to C++.\n\n"
+            "Rules:\n"
+            "- Output ONLY the function(s) required (no main, no tests, no cout/printf).\n"
+            "- Use std::vector<...> for Python list parameters.\n"
+            "- Do not write #include lines.\n"
+            "- Keep the same function name and parameter count as Python.\n\n"
+            "### Python:\n"
+            f"{python_source.strip()}\n\n"
+            "### C++:\n"
+        )
     return (
         "### Instruction:\n"
         "Translate this Python code to C++.\n\n"
@@ -182,10 +199,11 @@ def _generate_from_model(
     tokenizer: Any,
     *,
     max_new_tokens: int,
+    harness_style: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     import torch
 
-    prompt = build_translation_prompt(python_source)
+    prompt = build_translation_prompt(python_source, harness_style=harness_style)
     inputs = tokenizer(prompt, return_tensors="pt")
     if hasattr(model, "device"):
         device = model.device
@@ -222,9 +240,12 @@ def generate_cpp_base(
     hf_model_id: str,
     *,
     max_new_tokens: int = 2048,
+    harness_style: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     model, tokenizer = _load_base_model(hf_model_id)
-    return _generate_from_model(python_source, model, tokenizer, max_new_tokens=max_new_tokens)
+    return _generate_from_model(
+        python_source, model, tokenizer, max_new_tokens=max_new_tokens, harness_style=harness_style
+    )
 
 
 def generate_cpp(
@@ -232,6 +253,9 @@ def generate_cpp(
     adapter_dir: Path,
     *,
     max_new_tokens: int = 2048,
+    harness_style: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     model, tokenizer = _load_model(adapter_dir)
-    return _generate_from_model(python_source, model, tokenizer, max_new_tokens=max_new_tokens)
+    return _generate_from_model(
+        python_source, model, tokenizer, max_new_tokens=max_new_tokens, harness_style=harness_style
+    )
