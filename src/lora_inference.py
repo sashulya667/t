@@ -57,6 +57,15 @@ def extract_cpp_from_model_output(raw_text: str) -> str:
     return _strip_markdown_fence(text)
 
 
+def _read_base_model_name(model_dir: Path) -> str | None:
+    config_path = model_dir / "adapter_config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    base_name = str(config.get("base_model_name_or_path", "")).strip()
+    return base_name or None
+
+
 def discover_lora_backends(adapters_dir: Path | None = None) -> dict[str, Path]:
     root = (adapters_dir or DEFAULT_ADAPTERS_DIR).resolve()
     if not root.is_dir():
@@ -73,10 +82,65 @@ def discover_lora_backends(adapters_dir: Path | None = None) -> dict[str, Path]:
     return backends
 
 
+def discover_base_backends(adapters_dir: Path | None = None) -> dict[str, str]:
+    """Map base_<slug> -> HuggingFace model id (uses adapter_config.json only; no LoRA weights)."""
+    root = (adapters_dir or DEFAULT_ADAPTERS_DIR).resolve()
+    if not root.is_dir():
+        return {}
+    backends: dict[str, str] = {}
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        base_name = _read_base_model_name(child)
+        if base_name:
+            backends[f"base_{child.name}"] = base_name
+    return backends
+
+
 def adapter_path_for_backend(backend: str, adapters_dir: Path | None = None) -> Path | None:
     if not backend.startswith("lora_"):
         return None
     return discover_lora_backends(adapters_dir).get(backend)
+
+
+def _model_dtype_and_device() -> tuple[Any, bool, bool]:
+    import torch
+
+    use_cuda = torch.cuda.is_available()
+    use_mps = not use_cuda and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    if use_cuda and torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    elif use_cuda or use_mps:
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    return dtype, use_cuda, use_mps
+
+
+def _load_base_model(hf_model_id: str) -> tuple[Any, Any]:
+    key = f"base:{hf_model_id}"
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dtype, use_cuda, use_mps = _model_dtype_and_device()
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_id, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs: dict[str, Any] = {"trust_remote_code": True, "dtype": dtype}
+    if use_cuda:
+        model_kwargs["device_map"] = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(hf_model_id, **model_kwargs)
+    if use_mps:
+        model = model.to("mps")
+    model.eval()
+
+    _MODEL_CACHE[key] = (model, tokenizer)
+    return model, tokenizer
 
 
 def _load_model(adapter_dir: Path) -> tuple[Any, Any]:
@@ -88,8 +152,7 @@ def _load_model(adapter_dir: Path) -> tuple[Any, Any]:
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
-    base_name = str(config.get("base_model_name_or_path", "")).strip()
+    base_name = _read_base_model_name(adapter_dir)
     if not base_name:
         raise ValueError(f"Missing base_model_name_or_path in {adapter_dir}")
 
@@ -97,14 +160,7 @@ def _load_model(adapter_dir: Path) -> tuple[Any, Any]:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    use_cuda = torch.cuda.is_available()
-    use_mps = not use_cuda and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-    if use_cuda and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-    elif use_cuda or use_mps:
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
+    dtype, use_cuda, use_mps = _model_dtype_and_device()
 
     model_kwargs: dict[str, Any] = {"trust_remote_code": True, "dtype": dtype}
     if use_cuda:
@@ -120,15 +176,15 @@ def _load_model(adapter_dir: Path) -> tuple[Any, Any]:
     return model, tokenizer
 
 
-def generate_cpp(
+def _generate_from_model(
     python_source: str,
-    adapter_dir: Path,
+    model: Any,
+    tokenizer: Any,
     *,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int,
 ) -> tuple[str, dict[str, Any]]:
     import torch
 
-    model, tokenizer = _load_model(adapter_dir)
     prompt = build_translation_prompt(python_source)
     inputs = tokenizer(prompt, return_tensors="pt")
     if hasattr(model, "device"):
@@ -159,3 +215,23 @@ def generate_cpp(
         "latency_ms": latency_ms,
     }
     return cpp_text, usage
+
+
+def generate_cpp_base(
+    python_source: str,
+    hf_model_id: str,
+    *,
+    max_new_tokens: int = 2048,
+) -> tuple[str, dict[str, Any]]:
+    model, tokenizer = _load_base_model(hf_model_id)
+    return _generate_from_model(python_source, model, tokenizer, max_new_tokens=max_new_tokens)
+
+
+def generate_cpp(
+    python_source: str,
+    adapter_dir: Path,
+    *,
+    max_new_tokens: int = 2048,
+) -> tuple[str, dict[str, Any]]:
+    model, tokenizer = _load_model(adapter_dir)
+    return _generate_from_model(python_source, model, tokenizer, max_new_tokens=max_new_tokens)

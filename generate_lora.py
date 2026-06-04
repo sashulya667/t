@@ -37,7 +37,13 @@ REPO_ROOT, SRC_DIR = _bundle_roots()
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from lora_inference import clear_model_cache, discover_lora_backends, generate_cpp  # noqa: E402
+from lora_inference import (  # noqa: E402
+    clear_model_cache,
+    discover_base_backends,
+    discover_lora_backends,
+    generate_cpp,
+    generate_cpp_base,
+)
 
 
 def _iso_now() -> str:
@@ -66,7 +72,10 @@ def _relativize(cpp_path: Path, run_dir: Path) -> str:
 
 
 def _backend_folder_name(backend: str) -> str:
-    return backend.removeprefix("lora_")
+    for prefix in ("lora_", "base_"):
+        if backend.startswith(prefix):
+            return backend.removeprefix(prefix)
+    return backend
 
 
 def _zip_directory(source_dir: Path, *, exclude_suffixes: tuple[str, ...] = (".zip",)) -> Path:
@@ -98,9 +107,12 @@ def _run_generation(
     *,
     out_dir: Path,
     backends: list[str],
-    discovered: dict[str, Path],
+    lora_targets: dict[str, Path],
+    base_targets: dict[str, str],
+    base_only: bool,
     tests_by_item: dict[str, dict[str, Any]],
     item_ids: list[str],
+    max_new_tokens: int,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     candidates_dir = out_dir / "candidates"
@@ -115,18 +127,19 @@ def _run_generation(
             tasks.append((backend, item_id))
 
     last_backend: str | None = None
-    for backend, item_id in tqdm(tasks, total=len(tasks), desc=f"lora-generate:{out_dir.name}", unit="item"):
+    mode_label = "base-generate" if base_only else "lora-generate"
+    for backend, item_id in tqdm(tasks, total=len(tasks), desc=f"{mode_label}:{out_dir.name}", unit="item"):
         if backend != last_backend:
             clear_model_cache()
             last_backend = backend
-            print(f"[lora] backend: {backend} -> {out_dir}", flush=True)
+            print(f"[{mode_label}] backend: {backend} -> {out_dir}", flush=True)
 
         item_row = tests_by_item[item_id]
         source_text = str(
             item_row.get("python_source_untyped") or item_row.get("python_source_original") or ""
         ).strip()
-        adapter_dir = discovered[backend]
-        variant = "finetuned"
+        variant = "base" if base_only else "finetuned"
+        usage_source = "base_model" if base_only else "local_lora"
         gen_record: dict[str, Any] = {
             "item_id": item_id,
             "backend": backend,
@@ -154,7 +167,15 @@ def _run_generation(
             gen_record["failure_reason"] = "missing_source"
         else:
             try:
-                cpp_text, usage = generate_cpp(source_text, adapter_dir)
+                if base_only:
+                    hf_model_id = base_targets[backend]
+                    cpp_text, usage = generate_cpp_base(
+                        source_text, hf_model_id, max_new_tokens=max_new_tokens
+                    )
+                else:
+                    cpp_text, usage = generate_cpp(
+                        source_text, lora_targets[backend], max_new_tokens=max_new_tokens
+                    )
                 if cpp_text.strip():
                     cpp_target_dir = candidates_dir / backend / variant
                     cpp_target_dir.mkdir(parents=True, exist_ok=True)
@@ -163,7 +184,7 @@ def _run_generation(
                     gen_record["generation_ok"] = True
                     gen_record["cpp_path"] = _relativize(cpp_target, out_dir)
                     gen_record["llm_usage"] = {
-                        "calls": [{"source": "local_lora", **usage}],
+                        "calls": [{"source": usage_source, **usage}],
                         "llm_calls_total": 1,
                         "llm_prompt_tokens_total": int(usage.get("prompt_tokens", 0) or 0),
                         "llm_completion_tokens_total": int(usage.get("completion_tokens", 0) or 0),
@@ -197,9 +218,25 @@ def main() -> None:
         default=None,
         help="Adapters root (default: ./adapters in bundle, else repo trained_adapeters/)",
     )
-    parser.add_argument("--adapter", action="append", default=[], help="lora_<folder> backend(s)")
+    parser.add_argument(
+        "--adapter",
+        action="append",
+        default=[],
+        help="Backend(s): lora_<folder> or base_<folder> (with --base-only)",
+    )
+    parser.add_argument(
+        "--base-only",
+        action="store_true",
+        help="Use HuggingFace base weights only (no LoRA adapter). Needs adapter_config.json per model slug.",
+    )
     parser.add_argument("--out", type=Path, required=True, help="Run output dir (copy back to Mac)")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Max tokens to generate (default: env LORA_EVAL_MAX_NEW_TOKENS or 1024)",
+    )
     parser.add_argument(
         "--per-adapter",
         action="store_true",
@@ -212,16 +249,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    import os
+
+    max_new_tokens = args.max_new_tokens or int(os.environ.get("LORA_EVAL_MAX_NEW_TOKENS", "1024"))
+
     adapters_dir = args.adapters_dir
     if adapters_dir is None:
         bundle_adapters = REPO_ROOT / "adapters"
         adapters_dir = bundle_adapters if bundle_adapters.is_dir() else REPO_ROOT / "trained_adapeters"
 
-    discovered = discover_lora_backends(adapters_dir)
-    if not discovered:
-        raise SystemExit(f"No adapters under {adapters_dir}")
+    lora_targets = discover_lora_backends(adapters_dir)
+    base_targets = discover_base_backends(adapters_dir)
 
-    backends = list(args.adapter) if args.adapter else sorted(discovered.keys())
+    if args.base_only:
+        if not base_targets:
+            raise SystemExit(
+                f"No base models found under {adapters_dir} (need */adapter_config.json with base_model_name_or_path)"
+            )
+        discovered = base_targets
+        default_backends = sorted(base_targets.keys())
+    else:
+        if not lora_targets:
+            raise SystemExit(f"No LoRA adapters under {adapters_dir}")
+        discovered = lora_targets
+        default_backends = sorted(lora_targets.keys())
+
+    backends = list(args.adapter) if args.adapter else default_backends
     for name in backends:
         if name not in discovered:
             raise SystemExit(f"Unknown {name}. Available: {', '.join(sorted(discovered))}")
@@ -246,9 +299,12 @@ def main() -> None:
             total_records += _run_generation(
                 out_dir=sub_out,
                 backends=[backend],
-                discovered=discovered,
+                lora_targets=lora_targets,
+                base_targets=base_targets,
+                base_only=bool(args.base_only),
                 tests_by_item=tests_by_item,
                 item_ids=item_ids,
+                max_new_tokens=max_new_tokens,
             )
             if not args.no_zip:
                 zip_paths.append(_zip_directory(sub_out))
@@ -260,16 +316,21 @@ def main() -> None:
         total_records = _run_generation(
             out_dir=out_dir,
             backends=backends,
-            discovered=discovered,
+            lora_targets=lora_targets,
+            base_targets=base_targets,
+            base_only=bool(args.base_only),
             tests_by_item=tests_by_item,
             item_ids=item_ids,
+            max_new_tokens=max_new_tokens,
         )
         if not args.no_zip:
             zip_paths.append(_zip_directory(out_dir))
 
     for run_root in run_dirs:
+        prefix = "base" if args.base_only else "lora"
         manifest = {
             "phase": "generate_only",
+            "inference_mode": "base_only" if args.base_only else "lora_adapter",
             "layout": "per_adapter" if args.per_adapter and len(backends) > 1 else "combined",
             "tests": str(args.tests.resolve()),
             "variants": str(args.variants.resolve()) if args.variants else None,
@@ -279,11 +340,14 @@ def main() -> None:
             "run_dir": str(run_root),
         }
         if args.per_adapter and len(backends) > 1 and run_root != out_dir:
-            manifest["backends"] = [f"lora_{run_root.name}"]
+            manifest["backends"] = [f"{prefix}_{run_root.name}"]
+            if args.base_only:
+                manifest["hf_model_id"] = base_targets.get(f"base_{run_root.name}")
         (run_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     parent_manifest = {
         "phase": "generate_only",
+        "inference_mode": "base_only" if args.base_only else "lora_adapter",
         "layout": "per_adapter" if args.per_adapter and len(backends) > 1 else "combined",
         "tests": str(args.tests.resolve()),
         "variants": str(args.variants.resolve()) if args.variants else None,
@@ -300,7 +364,10 @@ def main() -> None:
         for sub in run_dirs:
             print(f"    {sub.name}/  (generation/ + candidates/)")
     else:
-        print("  Layout: combined (candidates/<backend>/finetuned/*.cpp)")
+        variant = "base" if args.base_only else "finetuned"
+        print(f"  Layout: combined (candidates/<backend>/{variant}/*.cpp)")
+    if args.base_only:
+        print("  Mode: BASE MODEL ONLY (no LoRA weights loaded)")
     if zip_paths:
         print("  Zip archives (copy these to your Mac):")
         for zp in zip_paths:
