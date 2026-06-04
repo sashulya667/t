@@ -66,12 +66,66 @@ def _strip_markdown_fence(text: str) -> str:
     return value
 
 
+_EXPLANATION_HEADING = re.compile(r"(?im)^#{1,3}\s*Explanation\b")
+_VARIANT_SEPARATOR = re.compile(r"\n={3,}\s*\n")
+
+
+def _looks_like_cpp(fragment: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(int|void|double|float|bool|char|unsigned|long|auto|std::)\b|[{;]",
+            fragment,
+        )
+    )
+
+
+def _take_first_cpp_variant(text: str) -> str:
+    parts = _VARIANT_SEPARATOR.split(text)
+    if len(parts) <= 1:
+        return text
+    for part in parts:
+        candidate = part.strip()
+        if candidate and _looks_like_cpp(candidate):
+            return candidate
+    return parts[0].strip()
+
+
+def _drop_trailing_non_cpp(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if lines and stripped.startswith("def "):
+            break
+        if lines and _EXPLANATION_HEADING.match(stripped):
+            break
+        if lines and stripped.startswith("### ") and not stripped.lower().startswith("### c++"):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _strip_include_lines(text: str) -> str:
+    kept = [line for line in text.splitlines() if not line.strip().startswith("#include")]
+    return "\n".join(kept).strip()
+
+
 def extract_cpp_from_model_output(raw_text: str) -> str:
+    """Keep the first plausible C++ snippet; drop chat, alternates, and trailing Python."""
     text = raw_text.strip()
     fence_match = re.search(r"```(?:cpp|c\+\+)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
     if fence_match:
-        return fence_match.group(1).strip()
-    return _strip_markdown_fence(text)
+        text = fence_match.group(1).strip()
+    else:
+        text = _strip_markdown_fence(text)
+
+    expl = _EXPLANATION_HEADING.search(text)
+    if expl:
+        text = text[: expl.start()]
+
+    text = _take_first_cpp_variant(text)
+    text = _drop_trailing_non_cpp(text)
+    text = _strip_include_lines(text)
+    return text.strip()
 
 
 def _read_base_model_name(model_dir: Path) -> str | None:
