@@ -1,0 +1,24 @@
+# Train + infer on GPU server
+# GPU server: LoRA inference only (no compile / CodeBLEU).
+#   pip install -r requirements-lora-server.txt
+torch>=2.2.0
+transformers>=4.45.0
+peft>=0.11.0
+accelerate>=0.33.0
+safetensors>=0.4.0
+tqdm>=4.66.0
+bitsandbytes>=0.43.0; platform_system != "Darwin"
+
+# LoRA fine-tuning for Qwen2.5-Coder (install on top of your venv).
+#   pip install -r requirements-training.txt
+accelerate>=0.33.0
+datasets>=2.20.0
+peft>=0.11.0
+trl>=0.9.0
+transformers>=4.45.0
+pyyaml>=6.0
+safetensors>=0.4.0
+# 4-bit loading on Linux + NVIDIA only:
+bitsandbytes>=0.43.0; platform_system != "Darwin"
+# FlashAttention on Linux CUDA (Vast); fallback to sdpa if install fails:
+flash-attn>=2.5.0; platform_system == "Linux"

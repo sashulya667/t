@@ -1,0 +1,36 @@
+# Pipeline benchmark split — Qwen2.5-Coder-1.5B (paths relative to lora_server_bundle/)
+model_name: Qwen/Qwen2.5-Coder-1.5B
+adapter_slug: qwen2.5-coder-1_5b
+train_file: data/splits/train.jsonl
+val_file: data/splits/val.jsonl
+output_dir: outputs/adapter
+
+max_seq_length: 2048
+num_train_epochs: 5
+
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 4
+
+learning_rate: 1.5e-4
+warmup_steps: 20
+weight_decay: 0.01
+
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+logging_steps: 5
+eval_strategy: epoch
+save_strategy: epoch
+save_total_limit: 2
+
+load_in_4bit: false
+use_gradient_checkpointing: false
+attn_implementation: flash_attention_2
+loss_type: chunked_nll
+
+dataloader_num_workers: 4
+dataloader_pin_memory: true
+packing: false
+optim: adamw_torch_fused
