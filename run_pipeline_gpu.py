@@ -163,19 +163,69 @@ def _zip_inference(bundle: Path, run_dir: Path, config_path: Path, infer_on: str
     return created
 
 
+ALL_CONFIGS = (
+    "configs/pipeline-0.5b.yaml",
+    "configs/pipeline-1.5b.yaml",
+    "configs/pipeline-7b.yaml",
+)
+
+
+def run_one(
+    bundle: Path,
+    config_path: Path,
+    *,
+    infer_on: str,
+    skip_train: bool,
+    skip_infer: bool,
+    harness_prompt: bool,
+    max_new_tokens: int | None,
+) -> None:
+    if not config_path.is_file():
+        raise SystemExit(f"Config not found: {config_path}")
+
+    cfg = _load_yaml(config_path)
+    adapter_slug = str(cfg.get("adapter_slug", "adapter"))
+    print(f"\n[pipeline] === {adapter_slug} ({config_path.name}) ===", flush=True)
+
+    adapter_dir = bundle / "adapters" / adapter_slug
+    if skip_train:
+        if not adapter_dir.is_dir():
+            raise SystemExit(f"--skip-train but missing {adapter_dir}")
+        print(f"[pipeline] Using existing adapter: {adapter_dir}", flush=True)
+    else:
+        adapter_dir = _run_train(bundle, config_path)
+
+    _zip_adapter(bundle, config_path, adapter_dir)
+
+    if not skip_infer:
+        run_dir = _run_inference(
+            bundle,
+            config_path,
+            infer_on=infer_on,
+            harness_prompt=harness_prompt,
+            max_new_tokens=max_new_tokens,
+        )
+        _zip_inference(bundle, run_dir, config_path, infer_on)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train adapter on pipeline split, infer, zip downloads")
     parser.add_argument(
         "--config",
         type=Path,
-        required=True,
-        help="Bundle config, e.g. configs/pipeline-1.5b.yaml",
+        default=None,
+        help="Bundle config, e.g. configs/pipeline-1.5b.yaml (omit with --all-models)",
+    )
+    parser.add_argument(
+        "--all-models",
+        action="store_true",
+        help="Run pipeline for 0.5B, 1.5B, and 7B sequentially",
     )
     parser.add_argument(
         "--infer-on",
         choices=("test", "full"),
         default="test",
-        help="Run inference on held-out test split (default) or full benchmark",
+        help="Inference on held-out test split (58 items) or full benchmark (568)",
     )
     parser.add_argument("--skip-train", action="store_true", help="Use existing adapters/<slug>/")
     parser.add_argument("--skip-infer", action="store_true", help="Train + zip adapter only")
@@ -183,11 +233,12 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=None)
     args = parser.parse_args()
 
-    bundle = _bundle_root()
-    config_path = args.config if args.config.is_absolute() else bundle / args.config
-    if not config_path.is_file():
-        raise SystemExit(f"Config not found: {config_path}")
+    if not args.all_models and args.config is None:
+        parser.error("Pass --config configs/pipeline-1.5b.yaml or --all-models")
+    if args.all_models and args.config is not None:
+        parser.error("Use --all-models alone, or a single --config")
 
+    bundle = _bundle_root()
     manifest_path = bundle / "data/splits/split_manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -197,30 +248,21 @@ def main() -> None:
             flush=True,
         )
 
-    cfg = _load_yaml(config_path)
-    adapter_slug = str(cfg.get("adapter_slug", "adapter"))
-    adapter_dir = bundle / "adapters" / adapter_slug
-
-    if args.skip_train:
-        if not adapter_dir.is_dir():
-            raise SystemExit(f"--skip-train but missing {adapter_dir}")
-        print(f"[pipeline] Using existing adapter: {adapter_dir}", flush=True)
-    else:
-        adapter_dir = _run_train(bundle, config_path)
-
-    _zip_adapter(bundle, config_path, adapter_dir)
-
-    if not args.skip_infer:
-        run_dir = _run_inference(
+    configs = [bundle / name for name in ALL_CONFIGS] if args.all_models else [bundle / args.config]
+    for config_path in configs:
+        run_one(
             bundle,
             config_path,
             infer_on=args.infer_on,
+            skip_train=bool(args.skip_train),
+            skip_infer=bool(args.skip_infer),
             harness_prompt=bool(args.harness_prompt),
             max_new_tokens=args.max_new_tokens,
         )
-        _zip_inference(bundle, run_dir, config_path, args.infer_on)
 
-    print(f"[pipeline] Done. Downloads under {bundle / 'downloads'}", flush=True)
+    print(f"\n[pipeline] All done. Downloads under {bundle / 'downloads'}", flush=True)
+    if args.all_models:
+        print("[pipeline] Zips: adapter_qwen2.5-coder-{05b,1_5b,7b}.zip + inference_*_*.zip", flush=True)
 
 
 if __name__ == "__main__":
